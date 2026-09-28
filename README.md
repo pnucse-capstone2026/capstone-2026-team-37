@@ -64,33 +64,35 @@ LeRobot과 ACT·SmolVLA 등의 공개 기술을 활용하면 사람이 시연한
 
 ### 3.1. 시스템 구성도
 
+Jetson은 데이터 수집과 로봇 제어를, GPU 서버는 정책 학습과 추론을 담당합니다.
+
 ```mermaid
-flowchart TD
-    C["상단·손목 카메라"] --> O["로봇 클라이언트"]
-    R["SO-101 팔로워"] -->|관절 상태| O
-    O -->|관측 전송 · gRPC| P["GPU 서버 · SmolVLA"]
-    T["정리 / 적층 지시문"] --> P
-    P -->|행동 청크| Q["행동 대기열"]
-    Q --> S["관절 이동량 제한 · 추종 감시"]
-    S -->|관절 명령| R
+flowchart TB
+    subgraph Site["로봇 작업 환경"]
+        Cameras["상단·손목 카메라"]
+        Leader["SO-101 리더 암"]
+        Follower["SO-101 팔로워 암"]
+    end
+
+    Jetson["Jetson Orin Nano · 수집 및 제어"]
+    GPU["RTX 3090 서버 · 학습 및 추론"]
+
+    Cameras -->|"영상"| Jetson
+    Leader -->|"시연·HIL 조작"| Jetson
+    Jetson <-->|"관절 명령·상태"| Follower
+    Jetson <-->|"gRPC · Tailscale"| GPU
 ```
-
-GPU 서버가 다음 행동을 계산하는 동안 클라이언트는 대기열의 행동을 실행합니다. 클라이언트 제어 주기는 30Hz를 기준으로 구성했습니다.
-
-**YOLO·좌표 변환은 수집용 자동 접근에 사용하며, 최종 자율 실행은 SmolVLA가 담당합니다.**
 
 ### 3.2. 사용 기술
 
-| 구성 요소 | 기술 |
+| 구분 | 기술 및 사양 |
 | --- | --- |
 | 로봇 | SO-101 리더·팔로워, Feetech STS3215 |
-| 관측 | 상단·손목 카메라, 640×480, 30fps, MJPG, 관절·그리퍼 상태 |
-| 클라이언트 | Linux 기반 로봇 PC, Jetson Orin Nano |
-| 학습·추론 서버 | NVIDIA RTX 3090 24GB |
-| 정책·프레임워크 | SmolVLA, LeRobot, PyTorch |
+| 카메라 | 상단·손목 USB 카메라, 640×480·30fps·MJPG |
+| 컴퓨팅 환경 | Jetson Orin Nano, RTX 3090 24GB, Ubuntu, Python 3.12 |
+| 정책·프레임워크 | SmolVLA, Hugging Face LeRobot, PyTorch |
 | 수집 자동화 | YOLO, OpenCV, 호모그래피, RBF 관절 보간 |
-| 통신 | gRPC, Tailscale |
-| 후속 학습 | HIL, Expert-only 미세조정, PCGrad, RWFM |
+| 통신·학습 기록 | gRPC, Tailscale, Weights & Biases |
 
 ---
 
@@ -98,81 +100,112 @@ GPU 서버가 다음 행동을 계산하는 동안 클라이언트는 대기열�
 
 ### 4.1. 전체 시스템 흐름도
 
-**시연 수집 → 정책 학습 → 자율 실행**으로 구성되며, 실행 중 수집한 교정 데이터를 후속 학습에 활용합니다.
+시연 데이터 수집 → 정책 학습 → 자율 실행으로 구성됩니다. 학습 및 추가 개선 과정은 4.2절에 정리했습니다.
+
+#### ① 시연 데이터 수집
+
+**상공 접근은 자동화하고, 파지·이송·배치는 사람이 시연합니다.** 자동 이동과 수동 조작을 포함한 5블록 전체 작업을 하나의 에피소드로 기록합니다.
 
 ```mermaid
-flowchart TD
-    subgraph DATA["시연 수집"]
-        A["블록 검출 · 자동 상공 접근"] --> B["리더 암으로 파지·이송·배치"]
-        B --> C["영상 · 관절 상태 · 행동 기록"]
+sequenceDiagram
+    actor User as 작업자 · 리더 암
+    participant Collector as 데이터 수집기
+    participant Robot as SO-101 팔로워
+    participant Dataset as 에피소드 기록기
+
+    User->>Collector: 작업 선택 · 녹화 시작
+    Collector->>Dataset: 에피소드 기록 시작
+    Note over Collector,Dataset: 수집 전 과정에서 두 카메라 영상·관절 상태·행동을 연속 기록
+
+    loop 색상 순서에 따라 5개 블록 처리
+        Collector->>Collector: 상단 영상에서 YOLO 블록 검출
+        Collector->>Collector: 호모그래피 좌표 변환 · RBF 관절 보간
+        Collector->>Robot: 블록 상공으로 자동 이동
+        Robot-->>Collector: 관절 상태
+        Collector-->>User: 수동 조작으로 전환
+
+        loop 미세 정렬 · 파지 · 이송 · 배치
+            User->>Collector: 리더 암 조작값
+            Collector->>Robot: 팔로워 관절 명령
+            Robot-->>Collector: 실제 관절 상태
+        end
+
+        User->>Collector: 배치 완료 · Enter 입력
+        Collector->>Robot: 관측 자세로 자동 복귀
+        Robot-->>Collector: 복귀 상태
     end
 
-    subgraph TRAIN["정책 학습"]
-        C --> D["데이터 정제 · 작업 지시 결합"]
-        D --> E["SmolVLA 미세조정"]
-    end
-
-    subgraph RUN["자율 실행"]
-        E --> F["동일 모델에 작업 지시 입력"]
-        F --> G["Task 1 · 지정 영역 정리"]
-        F --> H["Task 2 · 수직 적층"]
-    end
-
-    G -.-> I["실패 시 사람 개입 · HIL 수집"]
-    H -.-> I
-    I -.-> D
+    User->>Collector: 녹화 종료
+    Collector->>Dataset: 연속 에피소드 저장
 ```
 
-자동 접근은 **시연 수집 단계**에 사용합니다. 자율 실행에서는 SmolVLA가 관측과 지시를 바탕으로 접근부터 배치까지의 행동을 생성합니다.
+#### ② 자율 실행
+
+**동일한 SmolVLA 모델에서 지시문만 변경하여 정리·적층을 수행합니다.** 수집 단계의 YOLO·좌표 변환·RBF를 사용하지 않고, 모델이 관측과 지시문을 바탕으로 전체 조작 행동을 생성합니다.
+
+```mermaid
+sequenceDiagram
+    participant Client as Jetson 클라이언트
+    participant Server as GPU 서버 · SmolVLA
+    participant Queue as 행동 대기열
+    participant Robot as SO-101 팔로워
+
+    Client->>Server: 모델 및 작업 지시 설정
+    Server-->>Client: 추론 준비 완료
+
+    par 관측 전송 · 정책 추론
+        loop 최초 요청 또는 대기열 잔여량이 기준 이하일 때
+            Client->>Client: 상단·손목 영상 수집
+            Robot-->>Client: 현재 관절·그리퍼 상태
+            Client->>Server: 영상 · 상태 · 지시문
+            Server->>Server: 전처리 · 행동 청크 생성
+            Server-->>Client: 예측 행동 청크
+            Client->>Queue: 최신 예측으로 대기열 갱신
+        end
+
+    and 로봇 제어
+        loop 30Hz 기준 · 행동이 대기열에 있을 때
+            Client->>Queue: 다음 행동 요청
+            Queue-->>Client: 관절 목표값
+            Robot-->>Client: 실제 관절값
+            Client->>Client: 추종 오차 감시
+
+            alt 정상 실행
+                Client->>Client: 관절 이동량 제한
+                Client->>Robot: 관절·그리퍼 명령
+            else 정지 조건 충족
+                break 실행 중단
+                    Client->>Client: 제어 루프 종료
+                end
+            end
+        end
+    end
+```
+
+서버의 추론과 클라이언트의 행동 실행을 병행하여, 다음 행동을 계산하는 동안에도 기존 행동을 이어서 수행합니다.
 
 ### 4.2. 기능 설명 및 주요 기능 명세서
 
-#### 핵심 기능
-
-| 기능 | 구현 내용 |
-| --- | --- |
-| **연속 시연 수집** | 자동 상공 접근과 수동 조작을 연결하여 5블록 전체 작업 기록 |
-| **멀티태스크 실행** | 모델 교체 없이 자연어 지시로 정리·적층 전환 |
-| **비동기 제어** | GPU 서버의 추론과 클라이언트의 행동 실행을 병행 |
-| **HIL 교정 수집** | 실패 상태에서 사람이 개입하여 복구 동작 기록 |
-| **제어·진단** | 관절 이동량 제한, 추종 감시, 단계별 영상·행동 확인 |
-
 #### 모델 개선 과정
 
-초기 모델에서 발생한 **중앙 배치 편향**을 추가 시연·HIL 학습으로 개선하고, 남아 있던 편향을 **Same-Color PCGrad**로 해소했습니다.
+초기 모델의 **중앙 배치 편향과 실패 복구 부족**을 개선하기 위해 데이터 보강과 후속 학습을 진행했습니다.
 
-```mermaid
-flowchart TD
-    A["575ep · Full Fine-Tuning"] --> B["문제: 정리 지시에도 중앙 배치"]
-
-    B --> C["추가 시연 + 실패 복구 HIL 수집"]
-    C --> D["865ep → 822ep 정제"]
-    D --> E["Expert-only 추가 학습"]
-
-    E --> F["남은 배치 편향에 대한 분기 학습"]
-    G["파지 직후 분기 데이터 247ep"] --> F
-    F --> H["Same-Color Paired PCGrad"]
-    H --> I["실물 시험에서 중앙 배치 편향 해소 확인"]
-```
-
-| 단계 | 적용 내용 | 목적 및 결과 |
+| 단계 | 적용 방법 | 결과 및 역할 |
 | --- | --- | --- |
-| **575ep Full FT** | 정리 353ep + 적층 222ep 통합 학습 | 두 작업 수행, 정리의 중앙 배치 편향 발생 |
-| **822ep Expert-only** | 추가 시연·HIL 수집 후 865ep에서 43ep 제외 | 배치 행동 개선 및 실패 복구 학습 보강 |
-| **Same-Color PCGrad** | 분기 데이터와 동일 색상 단계 페어링 적용 | 남아 있던 중앙 배치 편향 해소 |
+| **① 멀티태스크 모방학습** | 정리·적층 **575ep**로 Full Fine-Tuning | 두 작업의 수행을 확인했으나, 정리 지시에도 중앙으로 배치하는 편향 발생 |
+| **② 추가 시연·HIL** | 추가 시연과 사람의 복구 동작으로 **865ep** 확보. 43ep 정제 후 **822ep**로 행동 생성부만 미세조정(Expert-only) | 실패 복구 데이터를 보강하고 정책 개선. 배치 편향은 일부 잔존 |
+| **③ Same-Color PCGrad** | 822ep 모델을 기반으로 파지 이후 이송·배치 데이터 **247ep** 학습. 동일 색상의 두 작업 간 그래디언트 충돌을 직교 투영으로 교정 | **실물 시험에서 중앙 배치 편향 해소 확인** |
 
-**파지 직후 분기 수집:** 블록을 집은 직후부터 정리는 지정 슬롯으로, 적층은 중앙 상공으로 이동하도록 시연했습니다. 정리 **120ep**, 적층 **127ep**를 수집하여 두 작업의 행동이 갈라지는 이송·배치 구간을 집중적으로 학습했습니다.
+#### 보상 가중 학습 · RWFM
 
-**Same-Color PCGrad:** 두 작업의 같은 색상 단계에서 그래디언트를 계산하고, 서로 충돌하는 성분을 투영하여 학습 업데이트를 조정했습니다.
+Reward-Weighted Flow Matching(RWFM)으로 구간별 Flow Matching 손실에 가중치를 적용했습니다. 실패 구간의 영향은 낮추고, 정상 수행과 사람의 교정 동작을 더 크게 반영했습니다.
 
-#### 보상 가중 학습
-
-별도의 후속 학습으로 **RWFM(Reward-Weighted Flow Matching)**을 구성했습니다. HIL 기록의 구간별 품질에 따라 손실 가중치를 다르게 적용합니다.
-
-| 실패 구간 | 정상 구간 | 사람 교정 구간 |
+| 실패 구간 | 정상 수행 구간 | 사람의 교정 구간 |
 | :---: | :---: | :---: |
-| **0.1** | **0.8** | **1.0** |
-| 학습 비중 축소 | 기본 행동 유지 | 교정 행동 강조 |
+| 0.1 | 0.8 | 1.0 |
+
+
+
 
 #### 주요 문제 해결
 
@@ -263,6 +296,15 @@ lerobot-project/
 ## 5. 설치 및 실행 방법
 
 ### 5.1. 설치절차 및 실행 방법
+
+#### 기본 설정 및 사용 가이드
+
+SO-101의 초기 설정과 LeRobot 기본 기능 사용법은 [RoboSEasy SO-ARM101 가이드](https://roboseasy.ai/docs/a-ba)를 참고하세요.
+
+- **초기 설정:** 로봇 조립, 소프트웨어 설치, USB·카메라 포트 고정, 캘리브레이션
+- **기본 기능:** 텔레오퍼레이션, 데이터 수집·재생·시각화·편집, 모델 학습 및 추론
+
+처음 사용하는 경우 위 가이드에 따라 장치 설정과 텔레오퍼레이션 동작을 확인한 뒤, 아래의 **프로젝트 소스 설치 및 서버·클라이언트 실행 절차**를 진행하세요. 프로젝트 실행에는 아래에 명시된 Python 환경과 제공 스크립트를 사용합니다.
 
 **실행 환경**
 
@@ -383,7 +425,6 @@ TASK_MODE=2 bash project/scripts/robot/run_smolvla_multitask_5blocks_inference.s
 4. [Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware](https://arxiv.org/abs/2304.13705), 2023.
 5. [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747), 2023.
 6. [Ultralytics YOLO](https://github.com/ultralytics/ultralytics).
-7. 부산대학교 정보컴퓨터공학부 졸업과제 안내 및 선넘지마 팀 중간·최종보고서.
 
 ### 오픈소스 활용
 
